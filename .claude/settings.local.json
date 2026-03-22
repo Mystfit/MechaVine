@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//home/mystfit/.arduino15/packages/esp32/hardware/esp32/**)",
+      "Read(//home/mystfit/Arduino/**)",
+      "Read(//home/mystfit/Arduino/libraries/**)",
+      "Read(//home/mystfit/.arduino15/**)"
+    ]
+  }
+}
