@@ -27,9 +27,15 @@
  *   - Flower starts open (servo at 0°), LED is red
  *   - When sound exceeds threshold, flower closes (servo eases to 180°),
  *     LED lerps from red to purple
- *   - After 3 seconds of silence, flower opens again (servo eases to 0°),
+ *   - After quiet delay of silence, flower opens again (servo eases to 0°),
  *     LED lerps from purple back to red
  *   - Sound during opening interrupts and triggers closing again
+ *
+ * Web Calibration:
+ *   - Connect to WiFi AP "Mechavine_XX" (password: CubaDupa26)
+ *   - Open 192.168.4.1 in browser
+ *   - Adjust threshold, quiet delay, and servo speeds via sliders
+ *   - Settings persist across power cycles (NVS)
  */
 
 #define USE_PCA9685_SERVO_EXPANDER
@@ -38,6 +44,13 @@
 
 #include <ESP32_WS2812B_RMT.h>
 #include <ESP32_INMP441.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <WebSocketsServer.h>
+
+#include "config.h"
+#include "web_page.h"
 
 // ── Pin Definitions ──────────────────────────────────────────────
 const uint8_t MIC_SCK  = 4;
@@ -45,14 +58,15 @@ const uint8_t MIC_WS   = 5;
 const uint8_t MIC_DIN  = 6;
 const uint8_t LED_PIN  = 7;
 
-// ── Configuration ────────────────────────────────────────────────
+// ── Configuration (compile-time constants) ──────────────────────
 #define NUM_LEDS          1
 #define SERVO_CHANNEL     15        // PCA9685 channel (0-15)
 #define SERVO_OPEN_DEG    0         // Degrees when flower is open
 #define SERVO_CLOSED_DEG  180       // Degrees when flower is closed
-#define SERVO_SPEED       60        // Degrees per second for easing
-#define SOUND_THRESHOLD   400000    // RMS threshold to trigger closing
-#define QUIET_DELAY_MS    3000      // Milliseconds of silence before opening
+
+// ── Network Configuration ───────────────────────────────────────
+const uint8_t VINE_ID = 1;         // Suffix for SSID: "Mechavine_01"
+const char* AP_PASSWORD = "CubaDupa26";
 
 // ── State Machine ────────────────────────────────────────────────
 enum FlowerState {
@@ -66,9 +80,19 @@ enum FlowerState {
 ServoEasing servo(PCA9685_DEFAULT_ADDRESS, &Wire);
 WS2812B_RMT leds(NUM_LEDS);
 INMP441 mic;
+WebServer server(80);
+WebSocketsServer webSocket(81);
+DNSServer dnsServer;
+Preferences preferences;
+MechaVineConfig cfg;
 
 FlowerState state = STATE_OPEN;
 unsigned long quietStartTime = 0;
+
+// Slow exponential moving average of RMS (~3s time constant at ~30Hz loop rate)
+// Used to detect sustained ambient noise, not just sharp spikes.
+static const float SLOW_RMS_ALPHA = 0.99f;
+float slowRMS = 0.0f;
 
 // ── Color Constants ──────────────────────────────────────────────
 // Open = Red (0xFF, 0x00, 0x00), Closed = Purple (0x80, 0x00, 0x80)
@@ -78,6 +102,11 @@ const uint8_t COLOR_CLOSE_R = 0x80, COLOR_CLOSE_G = 0x00, COLOR_CLOSE_B = 0x80;
 // ── Function Prototypes ─────────────────────────────────────────
 void updateLEDFromAngle(int angle);
 const char* stateName(FlowerState s);
+void sendConfig(uint8_t clientNum);
+void broadcastConfig();
+void broadcastRMS(float rms, float slowRms);
+void handleWSMessage(uint8_t num, uint8_t* payload, size_t length);
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length);
 
 void setup() {
   Serial.begin(115200);
@@ -87,8 +116,15 @@ void setup() {
   Serial.println("Shy Flower — Sound-Reactive Servo");
   Serial.println("===========================================");
 
+  // ── Load Configuration from NVS ──
+  Serial.println("\n[0/5] Loading configuration...");
+  preferences.begin("mechavine", false);
+  loadConfig(preferences, cfg);
+  Serial.printf("  Threshold: %u, Sustained: %u, Quiet: %u ms, Speed Open: %u, Speed Close: %u\n",
+                cfg.soundThreshold, cfg.sustainedThreshold, cfg.quietDelayMs, cfg.servoSpeedOpening, cfg.servoSpeedClosing);
+
   // ── Initialize I2S Microphone ──
-  Serial.println("\n[1/3] Initializing I2S microphone...");
+  Serial.println("\n[1/5] Initializing I2S microphone...");
   if (!mic.begin(MIC_SCK, MIC_WS, MIC_DIN)) {
     Serial.println("ERROR: Failed to initialize I2S!");
     Serial.println("Check INMP441 connections:");
@@ -102,7 +138,7 @@ void setup() {
   Serial.println("  OK — I2S initialized");
 
   // ── Initialize WS2812B LED ──
-  Serial.println("\n[2/3] Initializing LED...");
+  Serial.println("\n[2/5] Initializing LED...");
   if (!leds.begin(LED_PIN)) {
     Serial.println("ERROR: Failed to initialize RMT!");
     Serial.println("Check WS2812B connection:");
@@ -114,7 +150,7 @@ void setup() {
   Serial.println("  OK — LED initialized");
 
   // ── Initialize PCA9685 + Servo ──
-  Serial.println("\n[3/3] Initializing PCA9685 servo...");
+  Serial.println("\n[3/5] Initializing PCA9685 servo...");
   if (servo.InitializeAndCheckI2CConnection(&Serial)) {
     Serial.println("ERROR: PCA9685 not found on I2C bus!");
     Serial.println("Check I2C connections (SDA/SCL) and PCA9685 power.");
@@ -125,31 +161,66 @@ void setup() {
     while (1) { delay(1000); }
   }
   servo.setEasingType(EASE_CUBIC_IN_OUT);
-  servo.setSpeed(SERVO_SPEED);
+  servo.setSpeed(cfg.servoSpeedClosing);
   Serial.printf("  OK — Servo on PCA9685 channel %d, start %d deg\n", SERVO_CHANNEL, SERVO_OPEN_DEG);
 
   // ── Set initial LED to red (open state) ──
   leds.setPixel(0, WS2812B_Colors::RED);
   leds.show();
 
+  // ── Initialize WiFi Soft AP ──
+  Serial.println("\n[4/5] Starting WiFi AP...");
+  char ssid[32];
+  snprintf(ssid, sizeof(ssid), "Mechavine_%02d", VINE_ID);
+  WiFi.softAP(ssid, AP_PASSWORD);
+  delay(100);
+  Serial.printf("  OK — SSID: %s, IP: %s\n", ssid, WiFi.softAPIP().toString().c_str());
+
+  // ── Initialize Web Server + WebSocket ──
+  Serial.println("\n[5/5] Starting web server...");
+  dnsServer.start(53, "*", WiFi.softAPIP());
+  server.on("/", []() {
+    server.send_P(200, "text/html", WEB_PAGE);
+  });
+  server.onNotFound([]() {
+    server.sendHeader("Location", "http://192.168.4.1/");
+    server.send(302);
+  });
+  server.begin();
+  webSocket.begin();
+  webSocket.onEvent(webSocketEvent);
+  Serial.println("  OK — Web server on port 80, WebSocket on port 81");
+
   Serial.println("\n===========================================");
   Serial.println("Setup complete. Flower is OPEN.");
-  Serial.printf("Threshold: %d RMS, Quiet delay: %d ms\n", SOUND_THRESHOLD, QUIET_DELAY_MS);
+  Serial.printf("Threshold: %u RMS, Quiet delay: %u ms\n", cfg.soundThreshold, cfg.quietDelayMs);
+  Serial.printf("Servo speed: open %u, close %u deg/s\n", cfg.servoSpeedOpening, cfg.servoSpeedClosing);
   Serial.println("===========================================\n");
 }
 
 void loop() {
-  // Read microphone
+  // ── Service network ──
+  dnsServer.processNextRequest();
+  webSocket.loop();
+  server.handleClient();
+
+  // ── Delayed NVS save ──
+  checkConfigSave(preferences, cfg);
+
+  // ── Read microphone ──
   if (!mic.read()) return;
   float rms = mic.getRMS();
-  bool loud = rms > SOUND_THRESHOLD;
+  slowRMS = SLOW_RMS_ALPHA * slowRMS + (1.0f - SLOW_RMS_ALPHA) * rms;
+
+  bool loud      = rms     > cfg.soundThreshold;      // fast path: spike
+  bool sustained = slowRMS > cfg.sustainedThreshold;   // slow path: ambient
 
   FlowerState prevState = state;
 
   switch (state) {
     case STATE_OPEN:
-      if (loud) {
-        servo.startEaseTo(SERVO_CLOSED_DEG, SERVO_SPEED);
+      if (loud || sustained) {
+        servo.startEaseTo(SERVO_CLOSED_DEG, cfg.servoSpeedClosing);
         state = STATE_CLOSING;
       }
       break;
@@ -166,20 +237,20 @@ void loop() {
       // Keep LED purple
       leds.setPixel(0, (COLOR_CLOSE_R << 16) | (COLOR_CLOSE_G << 8) | COLOR_CLOSE_B);
       leds.show();
-      if (loud) {
-        // Reset quiet timer
+      if (loud || sustained) {
+        // Reset quiet timer (both spike and sustained ambient keep it closed)
         quietStartTime = millis();
-      } else if (millis() - quietStartTime >= QUIET_DELAY_MS) {
-        servo.startEaseTo(SERVO_OPEN_DEG, SERVO_SPEED);
+      } else if (millis() - quietStartTime >= cfg.quietDelayMs) {
+        servo.startEaseTo(SERVO_OPEN_DEG, cfg.servoSpeedOpening);
         state = STATE_OPENING;
       }
       break;
 
     case STATE_OPENING:
       updateLEDFromAngle(servo.getCurrentAngle());
-      if (loud) {
+      if (loud || sustained) {
         // Interrupt opening — close again
-        servo.startEaseTo(SERVO_CLOSED_DEG, SERVO_SPEED);
+        servo.startEaseTo(SERVO_CLOSED_DEG, cfg.servoSpeedClosing);
         state = STATE_CLOSING;
       } else if (!servo.isMoving()) {
         state = STATE_OPEN;
@@ -192,17 +263,108 @@ void loop() {
 
   // Log state transitions
   if (state != prevState) {
-    Serial.printf("State: %s -> %s  (RMS: %.0f)\n", stateName(prevState), stateName(state), rms);
+    Serial.printf("State: %s -> %s  (RMS: %.0f, slowRMS: %.0f)\n",
+                  stateName(prevState), stateName(state), rms, slowRMS);
+  }
+
+  // ── Broadcast RMS via WebSocket (~10Hz) ──
+  static uint8_t wsCounter = 0;
+  if (++wsCounter >= 3) {
+    wsCounter = 0;
+    broadcastRMS(rms, slowRMS);
   }
 
   // Periodic debug output
   static int debugCounter = 0;
   if (++debugCounter >= 30) {
     debugCounter = 0;
-    Serial.printf("RMS: %8.0f | State: %-8s | Angle: %d\n",
-                  rms, stateName(state), servo.getCurrentAngle());
+    Serial.printf("RMS: %8.0f | slowRMS: %8.0f | State: %-8s | Angle: %d\n",
+                  rms, slowRMS, stateName(state), servo.getCurrentAngle());
   }
 }
+
+// ── WebSocket Event Handler ─────────────────────────────────────
+
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
+  switch (type) {
+    case WStype_CONNECTED:
+      Serial.printf("[WS] Client %u connected\n", num);
+      sendConfig(num);
+      break;
+    case WStype_DISCONNECTED:
+      Serial.printf("[WS] Client %u disconnected\n", num);
+      break;
+    case WStype_TEXT:
+      handleWSMessage(num, payload, length);
+      break;
+    default:
+      break;
+  }
+}
+
+void sendConfig(uint8_t clientNum) {
+  char buf[200];
+  snprintf(buf, sizeof(buf),
+    "{\"cfg\":{\"threshold\":%u,\"sustainedThreshold\":%u,\"quietDelay\":%u,\"speedOpen\":%u,\"speedClose\":%u}}",
+    cfg.soundThreshold, cfg.sustainedThreshold, cfg.quietDelayMs, cfg.servoSpeedOpening, cfg.servoSpeedClosing);
+  webSocket.sendTXT(clientNum, buf);
+}
+
+void broadcastConfig() {
+  char buf[200];
+  snprintf(buf, sizeof(buf),
+    "{\"cfg\":{\"threshold\":%u,\"sustainedThreshold\":%u,\"quietDelay\":%u,\"speedOpen\":%u,\"speedClose\":%u}}",
+    cfg.soundThreshold, cfg.sustainedThreshold, cfg.quietDelayMs, cfg.servoSpeedOpening, cfg.servoSpeedClosing);
+  webSocket.broadcastTXT(buf);
+}
+
+void broadcastRMS(float rms, float slowRms) {
+  char buf[100];
+  snprintf(buf, sizeof(buf), "{\"rms\":%.0f,\"slowRms\":%.0f,\"state\":\"%s\"}",
+           rms, slowRms, stateName(state));
+  webSocket.broadcastTXT(buf);
+}
+
+void handleWSMessage(uint8_t num, uint8_t* payload, size_t length) {
+  // Parse simple JSON: {"set":"threshold","val":500000}
+  char* msg = (char*)payload;
+
+  char* setKey = strstr(msg, "\"set\":\"");
+  char* valStr = strstr(msg, "\"val\":");
+  if (!setKey || !valStr) return;
+
+  setKey += 7; // skip past "set":"
+  char* keyEnd = strchr(setKey, '"');
+  if (!keyEnd) return;
+  *keyEnd = '\0';
+
+  valStr += 6; // skip past "val":
+  uint32_t val = strtoul(valStr, NULL, 10);
+
+  if (strcmp(setKey, "threshold") == 0) {
+    cfg.soundThreshold = val;
+    Serial.printf("[WS] threshold = %u\n", val);
+  } else if (strcmp(setKey, "sustainedThreshold") == 0) {
+    cfg.sustainedThreshold = val;
+    Serial.printf("[WS] sustainedThreshold = %u\n", val);
+  } else if (strcmp(setKey, "quietDelay") == 0) {
+    cfg.quietDelayMs = val;
+    Serial.printf("[WS] quietDelay = %u\n", val);
+  } else if (strcmp(setKey, "speedOpen") == 0) {
+    cfg.servoSpeedOpening = (uint16_t)val;
+    Serial.printf("[WS] speedOpen = %u\n", val);
+  } else if (strcmp(setKey, "speedClose") == 0) {
+    cfg.servoSpeedClosing = (uint16_t)val;
+    Serial.printf("[WS] speedClose = %u\n", val);
+  } else {
+    return;
+  }
+
+  markConfigDirty();
+  broadcastConfig();
+}
+
+// ── LED + State Helpers ─────────────────────────────────────────
 
 /**
  * Interpolate LED color between red (0°) and purple (180°)
